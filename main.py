@@ -1,12 +1,11 @@
 import threading
 from socket import socket
+from adaptive_qps import AdaptiveQPSHandler  # 导入自定义的QPS处理模块
 
 SERVER_IP = 'localhost'
 SERVER_PORT = 32012
 
-
-def get_max_qps(qps: int) -> int:
-    return max(int(qps * 0.5), 10)
+qps = 0
 
 
 def socket_handler(cs: socket):
@@ -16,16 +15,24 @@ def socket_handler(cs: socket):
             break
         msg = data.decode()
         for line in msg.splitlines():
-            print(line)
             sp = line.split(':')
             if len(sp) != 2:
                 continue
-            result = get_max_qps(int(sp[1]))
             if sp[0] == 'QPS':
-                print('Received QPS:', sp[1], 'Result:', result)
-                cs.send(f'MaxQPS:{result}\n'.encode())
-
+                global qps
+                qps = int(sp[1])
+                # if qps > 0:
+                #     print('Received QPS:', qps)
     cs.close()
+
+
+def qps_handler(cs: socket, handler: AdaptiveQPSHandler):
+    while True:
+        print('CurrentQPS:', qps)
+        handler.reset(qps)
+        result = int(handler.get_max_qps(qps))
+        print('MaxQPS:', result)
+        cs.send(f'MaxQPS:{result}\n'.encode())
 
 
 def start_server():
@@ -36,7 +43,9 @@ def start_server():
     while True:
         cs, addr = ss.accept()
         print(f'Client connected from {addr}')
+        handler = AdaptiveQPSHandler()
         threading.Thread(target=socket_handler, args=(cs,)).start()
+        threading.Thread(target=qps_handler, args=(cs, handler)).start()
 
 
 if __name__ == '__main__':
