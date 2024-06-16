@@ -143,7 +143,7 @@ class DDPGAgent:
 
         with tf.GradientTape() as tape:
             actions = self.actor(state)
-            q_values = self.critic([state, actions])
+            q_values = self.critic([tf.convert_to_tensor(state), actions])
             actor_loss = -tf.reduce_mean(q_values)  # 求最大化Q值，即最小化负Q值
 
         actor_grads = tape.gradient(actor_loss, self.actor.trainable_variables)
