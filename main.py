@@ -52,7 +52,7 @@ def start_server():
     ss = socket()
     ss.bind((SERVER_IP, SERVER_PORT))
     ss.listen()
-    print(f'Server started at {SERVER_IP}:{SERVER_PORT}, calculation interval: {CALCULATE_INTERVAL_MS}ms')
+    print(f'Server started at {SERVER_IP}:{SERVER_PORT}, calculation interval: {CALCULATE_INTERVAL_MS}ms', flush=True)
     managers = {}
     while True:
         cs, addr = ss.accept()
