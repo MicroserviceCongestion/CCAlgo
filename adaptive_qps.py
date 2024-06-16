@@ -133,8 +133,8 @@ class DDPGAgent:
 
         with tf.GradientTape() as tape:
             target_action = self.target_actor(next_state)
-            future_q = self.target_critic(next_state, target_action)
-            current_q = self.critic(state, action)
+            future_q = self.target_critic([tf.convert_to_tensor(next_state), target_action])
+            current_q = self.critic([state, action])
             td_targets = reward + self.gamma * future_q
             loss = tf.losses.mean_squared_error(td_targets, current_q)
 
