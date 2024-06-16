@@ -5,55 +5,29 @@ import tensorflow as tf
 from tensorflow.keras import layers
 from collections import deque
 import psutil
-import requests
-import random
 
 # 设置 TensorFlow 日志级别为 ERROR
 tf.get_logger().setLevel('ERROR')
 NUM = 2
 
-# 模拟从环境中获取当前的 CPU 使用率和 QPS
-def get_current_cpu_usage():
-    # 这里应替换为从实际环境获取 CPU 使用率的逻辑
-    return psutil.cpu_percent(interval=1)
 
 class AdaptiveRateLimitEnv:
     def __init__(self, c_free, T, N):
         self.c_free = c_free
-        self.current_cpu = get_current_cpu_usage()
+        self.current_cpu = 0
         self.current_qps = 0
-        self.limit = 100  # 初始QPS限制
         self.T = T  # CPU使用率的阈值
         self.N = N  # 状态中包含的性能指标对数量
         self.memory_S = []  # 存储性能指标对
 
-    def reset(self, qps):
-        self.current_cpu = get_current_cpu_usage()
-        self.current_qps = qps
-        self.limit = 100
+    def reset(self):
+        self.current_cpu = 0
+        self.current_qps = 0
         self.memory_S.clear()  # 清空历史数据
-        self.prepopulate_interactions()
         return self.update_state()  # 返回初始状态
 
-    def prepopulate_interactions(self):
-        for _ in range(10):  # 与环境进行10次交互
-            state, _, _ = self.step(0)  # 动作a固定为0
-            self.limit = self.current_qps
-            count_qps = self.current_qps
-            if self.current_qps > self.limit:
-                count_qps = self.limit
-
-            self.current_cpu = get_current_cpu_usage()
-            self.memory_S.append((self.current_qps, self.current_cpu))
-
     def step(self, action):
-        self.limit = self.current_qps * action  # 动作是一个比例，用于计算新的QPS限制阈值
-        count_qps = self.current_qps
-        if self.current_qps > self.limit:
-            count_qps = self.limit
-
-        self.current_cpu = get_current_cpu_usage()  # 从环境中获取实际的 CPU 使用率
-        self.collect_performance_metric(count_qps, self.current_cpu)
+        self.collect_performance_metric(self.current_qps, self.current_cpu)
         state = self.update_state()
         reward = self.calculate_reward(action)
 
@@ -77,9 +51,10 @@ class AdaptiveRateLimitEnv:
         if self.current_cpu <= self.T:
             reward = average_qps * action
         else:
-            reward = -np.exp((self.current_cpu - self.T) / 10)
+            reward = -np.exp((self.current_cpu - self.T) * 10)
 
         return reward
+
 
 class DDPGAgent:
     def __init__(self, state_size, action_size):
@@ -182,21 +157,23 @@ class DDPGAgent:
         for (a, b) in zip(target_weights, weights):
             a.assign(b * tau + a * (1 - tau))
 
+
 class AdaptiveQPSHandler:
     def __init__(self):
-        self.env = AdaptiveRateLimitEnv(c_free=10, T=60, N=NUM)
+        self.env = AdaptiveRateLimitEnv(c_free=10, T=0.6, N=NUM)
         self.agent = DDPGAgent(state_size=2, action_size=1)
         self.state = None
 
-    def reset(self, qps):
-        self.state = self.env.reset(qps)
+    def reset(self):
+        self.state = self.env.reset()
         self.agent.reset_noise()
 
-    def get_max_qps(self, qps):
+    def get_max_qps(self, qps, cpu):
         self.env.current_qps = qps  # 更新环境中的 QPS
+        self.env.current_cpu = cpu
         action = self.agent.act(self.state)
         next_state, reward, _ = self.env.step(action)
         self.agent.store_transition(self.state, action, reward, next_state)
         self.agent.learn()
         self.state = next_state
-        return self.env.limit[0]
+        return action
