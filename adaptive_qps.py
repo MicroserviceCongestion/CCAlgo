@@ -136,7 +136,7 @@ class DDPGAgent:
             future_q = self.target_critic([tf.convert_to_tensor(next_state), target_action])
             current_q = self.critic([state, action])
             td_targets = reward + self.gamma * future_q
-            loss = tf.losses.mean_squared_error(td_targets, current_q)
+            loss = tf.losses.MeanSquaredError()(td_targets, current_q)
 
         critic_grads = tape.gradient(loss, self.critic.trainable_variables)
         self.critic_optimizer.apply_gradients(zip(critic_grads, self.critic.trainable_variables))
