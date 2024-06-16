@@ -1,13 +1,14 @@
+import os
 import threading
 import time
 from socket import socket
 from adaptive_qps import AdaptiveQPSHandler  # 导入自定义的QPS处理模块
-import matplotlib.pyplot as plt
 
 SERVER_IP = 'localhost'
 SERVER_PORT = 32012
 
 CALCULATE_INTERVAL_MS = 500
+
 
 class QpsManager:
     def __init__(self, handler, cs):
@@ -51,14 +52,20 @@ def start_server():
     ss = socket()
     ss.bind((SERVER_IP, SERVER_PORT))
     ss.listen()
-    print(f'Server started at {SERVER_IP}:{SERVER_PORT}')
+    print(f'Server started at {SERVER_IP}:{SERVER_PORT}, calculation interval: {CALCULATE_INTERVAL_MS}ms')
     managers = {}
     while True:
         cs, addr = ss.accept()
-        print(f'Client connected from {addr}')
+        print(f'Client connected from {addr}', flush=True)
         handler = AdaptiveQPSHandler()
         managers[addr] = QpsManager(handler, cs)
 
 
 if __name__ == '__main__':
+    if os.getenv("CCALGO_SERVER_IP") is not None:
+        SERVER_IP = os.getenv("CCALGO_SERVER_IP")
+    if os.getenv("CCALGO_SERVER_PORT") is not None:
+        SERVER_PORT = os.getenv("CCALGO_SERVER_PORT")
+    if os.getenv("CCALGO_CALCULATE_INTERVAL_MS") is not None:
+        CALCULATE_INTERVAL_MS = os.getenv("CCALGO_CALCULATE_INTERVAL_MS")
     start_server()

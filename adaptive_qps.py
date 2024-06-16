@@ -4,7 +4,6 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
 from collections import deque
-import psutil
 
 # 设置 TensorFlow 日志级别为 ERROR
 tf.get_logger().setLevel('ERROR')
