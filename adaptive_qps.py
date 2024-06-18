@@ -1,13 +1,23 @@
 # adaptive_qps.py
 
-import numpy as np
 import tensorflow as tf
-from tensorflow.keras import layers
-from collections import deque
+import math
+import random
+import gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.distributions import Normal
+import matplotlib.pyplot as plt
+
+use_cuda = torch.cuda.is_available()
+device   = torch.device("cuda" if use_cuda else "cpu")
 
 # 设置 TensorFlow 日志级别为 ERROR
 tf.get_logger().setLevel('ERROR')
-NUM = 2
+NUM = 1
 
 
 class AdaptiveRateLimitEnv:
@@ -55,124 +65,218 @@ class AdaptiveRateLimitEnv:
         return reward
 
 
-class DDPGAgent:
-    def __init__(self, state_size, action_size):
-        self.state_size = state_size
-        self.action_size = action_size
 
-        self.replay_buffer_R = deque(maxlen=200)  # 初始化R列表
-        self.memory = np.zeros((200, state_size * 2 * NUM + action_size + 1), dtype=np.float32)
-        self.pointer = 0
+class ValueNetwork(nn.Module):
+    def __init__(self, num_inputs, num_actions, hidden_size ,init_w = 3e-3):
+        super(ValueNetwork, self).__init__()
 
-        self.actor = self.create_actor(state_size * NUM, 1)  # 假设动作空间是1维
-        self.critic = self.create_critic(state_size * NUM, 1)
-        self.target_actor = self.create_actor(state_size * NUM, 1)
-        self.target_critic = self.create_critic(state_size * NUM, 1)
-        self.actor_optimizer = tf.keras.optimizers.Adam(0.001)
-        self.critic_optimizer = tf.keras.optimizers.Adam(0.002)
+        self.linear1 = nn.Linear(num_inputs + num_actions, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.linear3 = nn.Linear(hidden_size, 1)
 
-        self.target_actor.set_weights(self.actor.get_weights())
-        self.target_critic.set_weights(self.critic.get_weights())
+        self.linear3.weight.data.uniform_(-init_w,init_w)
+        self.linear3.bias.data.uniform_(-init_w,init_w)
 
-        self.initial_noise_scale = 1.0  # 初始噪声比例
-        self.noise_scale = self.initial_noise_scale  # 当前噪声比例
-        self.noise_decay = 0.995  # 噪声衰减率
+    def forward(self, state, action):
+        x = torch.cat([state, action], 1)
+        x = F.relu(self.linear1(x))
+        x = F.relu(self.linear2(x))
+        x = self.linear3(x)
+        return x
 
-        self.gamma = 0.99
-        self.tau = 0.005
+class PolicyNetwork(nn.Module):
+    def __init__(self, num_inputs, num_actions, hidden_size, init_w = 3e-3):
+        super(PolicyNetwork, self).__init__()
 
-    def create_actor(self, state_size, action_size):
-        model = tf.keras.Sequential([
-            layers.Dense(4, activation='relu', input_shape=(state_size,)),
-            layers.Dense(4, activation='relu'),
-            layers.Dense(action_size, activation='tanh')  # 使用tanh激活函数来输出动作值
-        ])
-        model.add(layers.Lambda(lambda x: (x + 1) / 2))  # 调整输出范围到[0, 1]
-        return model
+        self.linear1 = nn.Linear(num_inputs, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.linear3 = nn.Linear(hidden_size, num_actions)
 
-    def create_critic(self, state_size, action_size):
-        state_input = layers.Input(shape=(state_size,))
-        action_input = layers.Input(shape=(action_size,))
-        concat = layers.Concatenate()([state_input, action_input])
-        x = layers.Dense(4, activation='relu')(concat)
-        x = layers.Dense(4, activation='relu')(x)
-        x = layers.Dense(1)(x)  # 输出单一的Q值
-        return tf.keras.Model([state_input, action_input], x)
+        self.linear3.weight.data.uniform_(-init_w, init_w)
+        self.linear3.bias.data.uniform_(-init_w, init_w)
 
-    def reset_noise(self):
-        self.noise_scale = self.initial_noise_scale  # 重置噪声比例到初始值
+    def forward(self, x):
+        x = F.relu(self.linear1(x))
+        x = F.relu(self.linear2(x))
+        x = F.tanh(self.linear3(x))
+        return x
 
-    def act(self, state):
-        state = np.reshape(state, [-1, self.state_size * NUM])
-        action = self.actor.predict(state)[0]
-        noise = self.noise_scale * np.random.randn(self.action_size)
-        action = np.clip(action + noise, 0, 1)  # 保持动作在[0, 1]之间
-        self.noise_scale *= self.noise_decay  # 更新噪声比例
+    def get_action(self, state):
+        state = torch.FloatTensor(state).unsqueeze(0).to(device)
+        action = self.forward(state)
+        return action.detach().cpu().numpy()[0,0]
+
+class OUNoise(object):
+    def __init__(self, action_space, mu=0.0, theta = 0.15, max_sigma = 0.3, min_sigma = 0.3, decay_period = 100000):
+        self.mu = mu
+        self.theta = theta
+        self.sigma = max_sigma
+        self.max_sigma = max_sigma
+        self.min_sigma = min_sigma
+        self.decay_period = decay_period
+        self.action_dim = 1
+        self.low = 0
+        self.high = 1
+        self.reset()
+
+    def reset(self):
+        self.state = np.ones(self.action_dim) *self.mu
+
+    def evolve_state(self):
+        x = self.state
+        dx = self.theta* (self.mu - x) + self.sigma * np.random.randn(self.action_dim)
+        self.state = x + dx
+        return self.state
+
+    def get_action(self, action, t=0):
+        ou_state = self.evolve_state()
+        self.sigma = self.max_sigma - (self.max_sigma - self.min_sigma) * min(1.0, t / self.decay_period)
+        return np.clip(action + ou_state, self.low, self.high)
+
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+
+    def push(self, state, action, reward, next_state, done):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = (state, action, reward, next_state, done)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        state, action, reward, next_state, done = map(np.stack, zip(*batch))
+        return state, action, reward, next_state, done
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class NormalizedActions(gym.ActionWrapper):
+
+    def action(self, action):
+        low_bound = 0
+        upper_bound = 1
+
+        action = low_bound + (action + 1.0) * 0.5 * (upper_bound - low_bound)
+        #将经过tanh输出的值重新映射回环境的真实值内
+        action = np.clip(action, low_bound, upper_bound)
+
         return action
 
-    def store_transition(self, s, a, r, s_):
-        s = s.astype(np.float32)
-        s_ = s_.astype(np.float32)
-        transition = np.hstack((s, a, r, s_))
-        index = self.pointer % 200  # replace the old memory with new memory
-        self.memory[index, :] = transition
-        self.pointer += 1
+    def reverse_action(self, action):
+        low_bound = 0
+        upper_bound = 1
 
-    def learn(self):
-        if self.pointer < 200:
-            return
 
-        indices = np.random.choice(200, size=64)
-        datas = self.memory[indices, :]
-        state = datas[:, :self.state_size * NUM]
-        action = datas[:, self.state_size * NUM:self.state_size * NUM + self.action_size]
-        reward = datas[:, -self.state_size * NUM - 1:-self.state_size * NUM]
-        next_state = datas[:, -self.state_size * NUM:]
-        state = np.reshape(state, [-1, self.state_size * NUM])
-        next_state = np.reshape(next_state, [-1, self.state_size * NUM])
+        action = 2 * (action - low_bound) / (upper_bound - low_bound) - 1
+        action = np.clip(action, low_bound, upper_bound)
 
-        with tf.GradientTape() as tape:
-            target_action = self.target_actor(next_state)
-            future_q = self.target_critic([tf.convert_to_tensor(next_state), target_action])
-            current_q = self.critic([state, action])
-            td_targets = reward + self.gamma * future_q
-            loss = tf.losses.MeanSquaredError()(td_targets, current_q)
+        return action
 
-        critic_grads = tape.gradient(loss, self.critic.trainable_variables)
-        self.critic_optimizer.apply_gradients(zip(critic_grads, self.critic.trainable_variables))
+def plot(frame_idx, rewards):
+    plt.figure(figsize=(20,5))
+    plt.subplot(131)
+    plt.title('frame %s. reward: %s' % (frame_idx, rewards[-1]))
+    plt.plot(rewards)
+    plt.show()
 
-        with tf.GradientTape() as tape:
-            actions = self.actor(state)
-            q_values = self.critic([tf.convert_to_tensor(state), actions])
-            actor_loss = -tf.reduce_mean(q_values)  # 求最大化Q值，即最小化负Q值
 
-        actor_grads = tape.gradient(actor_loss, self.actor.trainable_variables)
-        self.actor_optimizer.apply_gradients(zip(actor_grads, self.actor.trainable_variables))
 
-        self.update_target(self.target_actor.variables, self.actor.variables, self.tau)
-        self.update_target(self.target_critic.variables, self.critic.variables, self.tau)
+class DDPG(object):
+    def __init__(self, action_dim, state_dim, hidden_dim):
+        super(DDPG,self).__init__()
+        self.action_dim, self.state_dim, self.hidden_dim = action_dim, state_dim, hidden_dim
+        self.batch_size = 128
+        self.gamma = 0.99
+        self.min_value = -np.inf
+        self.max_value = np.inf
+        self.soft_tau = 1e-2
+        self.replay_buffer_size = 5000
+        self.value_lr = 1e-3
+        self.policy_lr = 1e-4
 
-    def update_target(self, target_weights, weights, tau):
-        for (a, b) in zip(target_weights, weights):
-            a.assign(b * tau + a * (1 - tau))
+        self.value_net = ValueNetwork(state_dim, action_dim, hidden_dim).to(device)
+        self.policy_net = PolicyNetwork(state_dim, action_dim, hidden_dim).to(device)
+
+        self.target_value_net = ValueNetwork(state_dim, action_dim, hidden_dim).to(device)
+        self.target_policy_net = PolicyNetwork(state_dim, action_dim, hidden_dim).to(device)
+
+        for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
+            target_param.data.copy_(param.data)
+
+        for target_param, param in zip(self.target_policy_net.parameters(), self.policy_net.parameters()):
+            target_param.data.copy_(param.data)
+
+        self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=self.value_lr)
+        self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=self.policy_lr)
+
+        self.value_criterion = nn.MSELoss()
+
+        self.replay_buffer = ReplayBuffer(self.replay_buffer_size)
+
+    def ddpg_update(self):
+        state, action, reward, next_state, done = self.replay_buffer.sample(self.batch_size)
+
+        state = torch.FloatTensor(state).to(device)
+        next_state = torch.FloatTensor(next_state).to(device)
+        action = torch.FloatTensor(action).to(device)
+        reward = torch.FloatTensor(reward).unsqueeze(1).to(device)
+        done = torch.FloatTensor(np.float32(done)).unsqueeze(1).to(device)
+
+        policy_loss = self.value_net(state, self.policy_net(state))
+        policy_loss = -policy_loss.mean()
+
+        next_action = self.target_policy_net(next_state)
+        target_value = self.target_value_net(next_state, next_action.detach())
+        expected_value = reward + (1.0 - done) * self.gamma * target_value
+        expected_value = torch.clamp(expected_value, self.min_value, self.max_value)
+
+        value = self.value_net(state, action)
+        value_loss = self.value_criterion(value, expected_value.detach())
+
+        self.policy_optimizer.zero_grad()
+        policy_loss.backward()
+        self.policy_optimizer.step()
+
+        self.value_optimizer.zero_grad()
+        value_loss.backward()
+        self.value_optimizer.step()
+
+        for target_param, param in zip(self.target_value_net.parameters(), self.value_net.parameters()):
+            target_param.data.copy_(
+                target_param.data * (1.0 - self.soft_tau) + param.data * self.soft_tau
+            )
+
+        for target_param, param in zip(self.target_policy_net.parameters(), self.policy_net.parameters()):
+            target_param.data.copy_(
+                target_param.data * (1.0 - self.soft_tau) + param.data * self.soft_tau
+            )
+
 
 
 class AdaptiveQPSHandler:
     def __init__(self):
         self.env = AdaptiveRateLimitEnv(c_free=10, T=0.6, N=NUM)
-        self.agent = DDPGAgent(state_size=2, action_size=1)
+        self.ou_noise = OUNoise(1)
+        self.agent = DDPG(action_dim=1, state_dim=2, hidden_dim=256)
         self.state = None
 
     def reset(self):
         self.state = self.env.reset()
-        self.agent.reset_noise()
+        self.ou_noise.reset()
 
     def get_max_qps(self, qps, cpu):
         self.env.current_qps = qps  # 更新环境中的 QPS
         self.env.current_cpu = cpu
-        action = self.agent.act(self.state)
+        action = self.agent.policy_net.get_action(self.state)
+        action = self.ou_noise.get_action(action)
         next_state, reward, _ = self.env.step(action)
-        self.agent.store_transition(self.state, action, reward, next_state)
-        self.agent.learn()
+        self.agent.replay_buffer.push(self.state, action, reward, next_state, False)
+        if len(self.agent.replay_buffer) > 128:
+            self.agent.ddpg_update()
         self.state = next_state
         return action
